@@ -268,6 +268,7 @@ class ModGenerator:
         project_dir.mkdir(parents=True, exist_ok=True)
         existing_markers = [
             project_dir / "mod_manifest.json",
+            project_dir / f"{namespace}.json",
             project_dir / "Code" / "ModEntry.cs",
             *project_dir.glob("*.csproj"),
         ]
@@ -321,7 +322,9 @@ class ModGenerator:
         )
         (code_dir / "ModEntry.cs").write_text(entry_content, encoding="utf-8", newline="\n")
 
-        # mod_manifest.json
+        # Manifest — written as {namespace}.json (not mod_manifest.json) so the
+        # installed mod exposes only one manifest file. The game registers one
+        # mod per manifest, so having both names causes duplicate registration.
         manifest = {
             "id": mod_id,
             "pck_name": namespace,
@@ -333,7 +336,7 @@ class ModGenerator:
             "has_dll": True,
             "affects_gameplay": True,
         }
-        (project_dir / "mod_manifest.json").write_text(
+        (project_dir / f"{namespace}.json").write_text(
             json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
             newline="\n",
@@ -1037,11 +1040,17 @@ class ModGenerator:
         project_dir: str,
         configuration: str = "Debug",
         build_pck_artifact: bool = False,
+        pck_method: str = "auto",
     ) -> dict:
         """Build a mod project and optionally build its PCK."""
         result = build_project(project_dir, configuration=configuration, game_dir=self.game_dir)
         if build_pck_artifact and result.get("success"):
-            result["pck"] = build_project_pck(project_dir)
+            result["pck"] = build_project_pck(
+                project_dir,
+                method=pck_method,
+                configuration=configuration,
+                game_dir=self.game_dir,
+            )
             result["success"] = bool(result["success"]) and bool(result["pck"].get("success"))
         return result
 
@@ -1084,12 +1093,17 @@ class ModGenerator:
         project_dir: str,
         output_path: str = "",
         convert_pngs: bool = True,
+        method: str = "auto",
+        configuration: str = "Debug",
     ) -> dict:
         """Build a PCK using project-aware defaults."""
         return build_project_pck(
             project_dir,
             output_path=output_path,
             convert_pngs=convert_pngs,
+            method=method,
+            configuration=configuration,
+            game_dir=self.game_dir,
         )
 
     def deploy_mod(

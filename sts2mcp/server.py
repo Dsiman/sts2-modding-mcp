@@ -610,7 +610,10 @@ async def list_tools() -> list[types.Tool]:
             name="build_mod",
             description=(
                 "Build a mod project using project-aware defaults from its .csproj and manifest. "
-                "Can optionally build the project's PCK artifact in the same call."
+                "Can optionally build the project's PCK artifact in the same call. "
+                "When build_pck_artifact=true and the csproj defines a <Target Name=\"GodotPublish\">, "
+                "the PCK is built via `dotnet msbuild -t:GodotPublish` (real Godot export); otherwise "
+                "a pure-Python builder is used."
             ),
             inputSchema={
                 "type": "object",
@@ -618,6 +621,17 @@ async def list_tools() -> list[types.Tool]:
                     "project_dir": {"type": "string", "description": "Path to mod project directory"},
                     "configuration": {"type": "string", "default": "Debug"},
                     "build_pck_artifact": {"type": "boolean", "default": False},
+                    "pck_method": {
+                        "type": "string",
+                        "enum": ["auto", "godot_publish", "python"],
+                        "default": "auto",
+                        "description": (
+                            "How to build the PCK when build_pck_artifact=true. "
+                            "'auto' prefers GodotPublish if defined in the .csproj; "
+                            "'godot_publish' forces `dotnet msbuild -t:GodotPublish`; "
+                            "'python' forces the built-in Python PCK builder."
+                        ),
+                    },
                 },
                 "required": ["project_dir"],
             },
@@ -687,7 +701,9 @@ async def list_tools() -> list[types.Tool]:
                 "IMPORTANT: Do NOT call this for normal code lookups — use search_game_code, "
                 "get_entity_source, or browse_namespace instead, which work from the pre-built index. "
                 "Only call this if get_setup_status shows decompiled_exists=false, or after a game version update. "
-                "Requires ilspycmd."
+                "Requires ilspycmd. "
+                "Pass dll_path + output_dir to decompile a non-default install (e.g. public-beta) into a "
+                "parallel folder like decompiled-beta/, leaving the default index untouched."
             ),
             inputSchema={
                 "type": "object",
@@ -696,6 +712,19 @@ async def list_tools() -> list[types.Tool]:
                         "type": "boolean",
                         "description": "Force re-decompilation even if source already exists. Default false.",
                         "default": False,
+                    },
+                    "dll_path": {
+                        "type": "string",
+                        "description": "Override sts2.dll path. Default: auto-detected from STS2_GAME_DIR.",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Override output directory. Default: STS2_DECOMPILED_DIR. Use this to write to e.g. decompiled-beta/.",
+                    },
+                    "run_roslyn": {
+                        "type": "boolean",
+                        "description": "After decompiling, build roslyn_index.json in the output dir. Default true.",
+                        "default": True,
                     },
                 },
             },
@@ -707,7 +736,9 @@ async def list_tools() -> list[types.Tool]:
                 "Build a Godot .pck resource pack from a directory. Pure Python — no Godot install needed. "
                 "Converts .png images to .ctex format with .import remaps. "
                 "Packs .tscn scenes, .json, .tres files as-is. "
-                "The PCK is required for mods that include visual assets (images, scenes, materials)."
+                "The PCK is required for mods that include visual assets (images, scenes, materials). "
+                "Note: for project-aware builds, prefer `build_mod` with build_pck_artifact=true — when the "
+                ".csproj defines a <Target Name=\"GodotPublish\">, it uses real Godot export via MSBuild."
             ),
             inputSchema={
                 "type": "object",
@@ -3605,6 +3636,7 @@ async def _handle_tool(name: str, args: dict):
             args["project_dir"],
             configuration=args.get("configuration", "Debug"),
             build_pck_artifact=args.get("build_pck_artifact", False),
+            pck_method=args.get("pck_method", "auto"),
         )
 
     elif name == "install_mod":
@@ -3629,7 +3661,12 @@ async def _handle_tool(name: str, args: dict):
         )
 
     elif name == "decompile_game":
-        return await _decompile_game(force=args.get("force", False))
+        return await _decompile_game(
+            force=args.get("force", False),
+            dll_path=args.get("dll_path"),
+            output_dir=args.get("output_dir"),
+            run_roslyn=args.get("run_roslyn", True),
+        )
 
     # ── Asset & PCK ──
     elif name == "build_pck":
@@ -4671,65 +4708,108 @@ def _launch_game(remote_debug: bool = False, renderer: str | None = None, extra_
         return {"success": False, "error": str(e)}
 
 
-async def _decompile_game(force: bool = False) -> dict:
-    from .setup import _find_ilspycmd
+async def _decompile_game(
+    force: bool = False,
+    dll_path: str | None = None,
+    output_dir: str | None = None,
+    run_roslyn: bool = True,
+) -> dict:
+    from .setup import _find_ilspycmd, build_roslyn_index, find_game_binary
 
-    from .setup import find_game_binary
-
-    output_dir = Path(DECOMPILED_DIR)
+    # Resolve overrides — custom invocations target a parallel install (e.g. beta).
+    is_custom_target = dll_path is not None or output_dir is not None
+    out_dir = Path(output_dir) if output_dir else Path(DECOMPILED_DIR)
 
     # Guard: skip if source already exists (unless forced)
-    if not force and output_dir.exists():
-        cs_files = list(output_dir.rglob("*.cs"))
+    if not force and out_dir.exists():
+        cs_files = list(out_dir.rglob("*.cs"))
         if len(cs_files) > 100:
-            roslyn_exists = (output_dir / "roslyn_index.json").exists()
+            roslyn_exists = (out_dir / "roslyn_index.json").exists()
             return {
                 "success": True,
                 "already_decompiled": True,
+                "output_dir": str(out_dir),
                 "cs_file_count": len(cs_files),
                 "roslyn_index_exists": roslyn_exists,
                 "message": (
-                    f"Source already decompiled ({len(cs_files)} files). "
-                    f"Roslyn index: {'ready' if roslyn_exists else 'will auto-build on first query'}. "
-                    "Use search_game_code, get_entity_source, or browse_namespace to search the code. "
+                    f"Source already decompiled at {out_dir} ({len(cs_files)} files). "
+                    f"Roslyn index: {'ready' if roslyn_exists else 'missing — pass run_roslyn=true with force=true to build'}. "
                     "Pass force=true to re-decompile (only needed after a game update)."
                 ),
             }
 
-    dll_path_str = find_game_binary(GAME_DIR)
-    if not dll_path_str:
-        return {"success": False, "error": f"Game binary not found in {GAME_DIR}"}
-    dll_path = Path(dll_path_str)
+    # Resolve dll path: explicit > auto-detect from default game dir
+    if dll_path:
+        dll_path_resolved = dll_path
+        if not Path(dll_path_resolved).is_file():
+            return {"success": False, "error": f"sts2.dll not found at {dll_path_resolved}"}
+    else:
+        dll_path_resolved = find_game_binary(GAME_DIR)
+        if not dll_path_resolved:
+            return {"success": False, "error": f"Game binary not found in {GAME_DIR}"}
 
     exe = _find_ilspycmd()
     if not exe:
         return {"success": False, "error": "ilspycmd not found. Install: dotnet tool install -g ilspycmd"}
 
     # Clear existing
-    if output_dir.exists():
+    if out_dir.exists():
         import shutil
-        shutil.rmtree(str(output_dir))
-    output_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(str(out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         result = subprocess.run(
-            [exe, "-p", "-o", str(output_dir), str(dll_path)],
+            [exe, "-p", "-o", str(out_dir), str(dll_path_resolved)],
             capture_output=True,
             text=True,
             timeout=300,
         )
-        if result.returncode == 0:
-            # Reset index
-            game_data._indexed = False
-            game_data.entities.clear()
-            game_data.by_type.clear()
-            game_data.all_files.clear()
-            game_data.hooks.clear()
-            game_data.console_commands.clear()
-            return {"success": True, "output_dir": str(output_dir), "message": "Decompilation complete. Index will rebuild on next query."}
-        return {"success": False, "stderr": result.stderr}
+        if result.returncode != 0:
+            return {"success": False, "stderr": result.stderr, "output_dir": str(out_dir)}
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "Decompilation timed out after 5 minutes"}
+
+    # Only reset the in-memory game_data index when we wrote to the default dir;
+    # parallel-install decompiles (beta) must not invalidate the live stable index.
+    if not is_custom_target:
+        game_data._indexed = False
+        game_data.entities.clear()
+        game_data.by_type.clear()
+        game_data.all_files.clear()
+        game_data.hooks.clear()
+        game_data.console_commands.clear()
+
+    response: dict = {
+        "success": True,
+        "output_dir": str(out_dir),
+        "dll_path": str(dll_path_resolved),
+        "is_custom_target": is_custom_target,
+    }
+
+    if run_roslyn:
+        roslyn_result = build_roslyn_index(str(out_dir))
+        response["roslyn"] = roslyn_result
+        if roslyn_result.get("success"):
+            response["message"] = (
+                f"Decompiled to {out_dir} and built roslyn_index.json "
+                f"({roslyn_result.get('size_mb')} MB). "
+                + ("Custom target — default search index unchanged." if is_custom_target
+                   else "Default index will rebuild on next query.")
+            )
+        else:
+            response["message"] = (
+                f"Decompiled to {out_dir} but roslyn index build failed: "
+                f"{roslyn_result.get('error')}. Code search will fall back to regex parsing."
+            )
+    else:
+        response["message"] = (
+            f"Decompiled to {out_dir}. "
+            + ("Custom target — default search index unchanged." if is_custom_target
+               else "Index will rebuild on next query.")
+        )
+
+    return response
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────

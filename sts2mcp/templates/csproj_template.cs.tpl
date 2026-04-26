@@ -57,8 +57,8 @@
     <Copy SourceFiles="$(TargetDir)$(TargetName).runtimeconfig.json"
           DestinationFolder="$(_ModOutputDir)"
           Condition="Exists('$(TargetDir)$(TargetName).runtimeconfig.json')" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\mod_manifest.json"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\$(AssemblyName).json"
           DestinationFolder="$(_ModOutputDir)"
-          Condition="Exists('$(MSBuildProjectDirectory)\mod_manifest.json')" />
+          Condition="Exists('$(MSBuildProjectDirectory)\$(AssemblyName).json')" />
   </Target>
 </Project>

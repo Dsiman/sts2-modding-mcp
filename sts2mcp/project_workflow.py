@@ -786,16 +786,24 @@ def apply_generator_output(
 
 
 def _collect_build_artifacts(context: ProjectContext, configuration: str) -> list[Path]:
-    bin_dir = context.project_dir / "bin" / configuration
-    if not bin_dir.exists():
-        return []
-
-    dll_candidates = sorted(
-        (
+    # Standard .NET output lives under bin/<config>/. Godot's C# build pipeline
+    # instead writes to .godot/mono/temp/bin/<config>/ — check both so that
+    # projects with Godot MSBuild integration (e.g. those using GodotPublish)
+    # still install correctly.
+    candidate_dirs = [
+        context.project_dir / "bin" / configuration,
+        context.project_dir / ".godot" / "mono" / "temp" / "bin" / configuration,
+    ]
+    dll_candidates: list[Path] = []
+    for bin_dir in candidate_dirs:
+        if not bin_dir.exists():
+            continue
+        dll_candidates.extend(
             path
             for path in bin_dir.rglob("*.dll")
             if path.is_file() and _artifact_base_name(path) not in DEFAULT_CONFIG_EXCLUSIONS
-        ),
+        )
+    dll_candidates.sort(
         key=lambda item: item.stat().st_mtime if item.exists() else 0,
         reverse=True,
     )
@@ -945,13 +953,136 @@ def build_project(
     }
 
 
+_GODOT_PUBLISH_TARGET_RE = re.compile(
+    r'<Target\s+[^>]*Name\s*=\s*"GodotPublish"', re.IGNORECASE
+)
+
+
+def _csproj_has_godot_publish(csproj_path: Path | None) -> bool:
+    """Return True when the .csproj defines a <Target Name="GodotPublish" ... />."""
+    if not csproj_path or not csproj_path.exists():
+        return False
+    try:
+        text = csproj_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_GODOT_PUBLISH_TARGET_RE.search(text))
+
+
+def _run_godot_publish(
+    context,
+    *,
+    configuration: str,
+    timeout: int,
+    game_dir: str | Path | None,
+    cancel_event: Any,
+) -> dict[str, Any]:
+    """Invoke `dotnet msbuild -t:GodotPublish` to build a real Godot-exported PCK.
+
+    The GodotPublish target (provided by Sts2 mod templates) runs Godot headlessly
+    via `--export-pack BasicExport`, producing a proper Godot PCK written to the
+    game's mods folder at `$(ModsPath)$(ProjectName)/$(ProjectName).pck`.
+    """
+    env = None
+    if game_dir:
+        env = {**os.environ, "STS2_GAME_DIR": str(game_dir)}
+
+    cmd = [
+        "dotnet",
+        "msbuild",
+        str(context.csproj_path),
+        "-t:GodotPublish",
+        f"-p:Configuration={configuration}",
+        "-v:minimal",
+    ]
+
+    try:
+        if cancel_event is not None:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(context.project_dir),
+                env=env,
+            )
+            try:
+                import time as _time
+                deadline = _time.monotonic() + timeout
+                while proc.poll() is None:
+                    if _time.monotonic() > deadline:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        return {
+                            "success": False,
+                            "error": f"GodotPublish timed out after {timeout} seconds",
+                        }
+                    if cancel_event.is_set():
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        return {
+                            "success": False,
+                            "cancelled": True,
+                            "error": "GodotPublish cancelled (new changes detected)",
+                        }
+                    try:
+                        proc.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                stdout = proc.stdout.read() if proc.stdout else ""
+                stderr = proc.stderr.read() if proc.stderr else ""
+                returncode = proc.returncode
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(context.project_dir),
+                timeout=timeout,
+                env=env,
+            )
+            stdout = result.stdout
+            stderr = result.stderr
+            returncode = result.returncode
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"GodotPublish timed out after {timeout} seconds"}
+    except FileNotFoundError:
+        return {"success": False, "error": "dotnet CLI not found. Install .NET SDK 9.0."}
+
+    return {
+        "success": returncode == 0,
+        "stdout": stdout,
+        "stderr": stderr,
+        "return_code": returncode,
+        "command": " ".join(cmd),
+    }
+
+
 def build_project_pck(
     project_dir: str | Path,
     *,
     output_path: str = "",
     convert_pngs: bool = True,
+    method: str = "auto",
+    configuration: str = "Debug",
+    timeout: int = 300,
+    game_dir: str | Path | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
-    """Build a PCK for a mod project using its manifest/resource layout."""
+    """Build a PCK for a mod project using its manifest/resource layout.
+
+    Args:
+        method: "auto" (default) uses GodotPublish when the .csproj defines it,
+            falling back to the Python builder. "godot_publish" forces MSBuild.
+            "python" forces the Python PCK builder.
+        configuration: Build configuration passed to GodotPublish (Debug / Release).
+        game_dir: Overrides STS2_GAME_DIR for the MSBuild subprocess (affects
+            $(ModsPath) resolution inside the target).
+    """
     try:
         context = _resolve_project_context(project_dir)
     except FileNotFoundError as exc:
@@ -973,6 +1104,102 @@ def build_project_pck(
             "validation": validation,
         }
 
+    normalized_method = (method or "auto").lower()
+    if normalized_method not in {"auto", "godot_publish", "python"}:
+        return {
+            "success": False,
+            "error": f"Invalid method '{method}'. Use 'auto', 'godot_publish', or 'python'.",
+            "project": context.as_dict(),
+        }
+
+    has_target = _csproj_has_godot_publish(context.csproj_path)
+    use_godot_publish = (
+        normalized_method == "godot_publish"
+        or (normalized_method == "auto" and has_target)
+    )
+
+    if normalized_method == "godot_publish" and not has_target:
+        return {
+            "success": False,
+            "error": (
+                "method='godot_publish' requested but the project's .csproj has no "
+                "<Target Name=\"GodotPublish\" ...> definition."
+            ),
+            "project": context.as_dict(),
+        }
+
+    if use_godot_publish:
+        publish_result = _run_godot_publish(
+            context,
+            configuration=configuration,
+            timeout=timeout,
+            game_dir=game_dir,
+            cancel_event=cancel_event,
+        )
+        if not publish_result.get("success"):
+            return {
+                **publish_result,
+                "method": "godot_publish",
+                "project": context.as_dict(),
+                "validation": validation,
+            }
+
+        # GodotPublish writes the PCK under $(ModsPath)$(ProjectName)/$(ProjectName).pck.
+        # Locate it by checking known candidate locations.
+        produced_pck = _locate_published_pck(context, game_dir=game_dir)
+        target = Path(output_path) if output_path else context.project_dir / f"{context.pck_name}.pck"
+
+        if produced_pck and produced_pck.exists():
+            # Mirror the PCK to the project dir (or user-specified output) so that
+            # downstream deploy/packaging steps find it at the expected path.
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if produced_pck.resolve() != target.resolve():
+                    shutil.copy2(produced_pck, target)
+            except OSError as exc:
+                return {
+                    "success": False,
+                    "error": f"GodotPublish succeeded but copy to {target} failed: {exc}",
+                    "method": "godot_publish",
+                    "published_pck": str(produced_pck),
+                    "project": context.as_dict(),
+                    "validation": validation,
+                    "stdout": publish_result.get("stdout", ""),
+                    "stderr": publish_result.get("stderr", ""),
+                }
+
+            size = target.stat().st_size if target.exists() else None
+            return {
+                "success": True,
+                "method": "godot_publish",
+                "command": publish_result.get("command"),
+                "output_path": str(target),
+                "published_pck": str(produced_pck),
+                "pck_size": size,
+                "project": context.as_dict(),
+                "source_dir": str(context.resource_dir),
+                "base_prefix": f"{context.pck_name}/",
+                "validation": validation,
+                "stdout": publish_result.get("stdout", ""),
+                "stderr": publish_result.get("stderr", ""),
+            }
+
+        return {
+            "success": False,
+            "method": "godot_publish",
+            "error": (
+                "GodotPublish reported success but no PCK was found. Check that "
+                "$(GodotPath) is set in Directory.Build.props and that the "
+                "'BasicExport' preset exists in export_presets.cfg."
+            ),
+            "command": publish_result.get("command"),
+            "project": context.as_dict(),
+            "validation": validation,
+            "stdout": publish_result.get("stdout", ""),
+            "stderr": publish_result.get("stderr", ""),
+        }
+
+    # Python fallback path (unchanged behavior)
     target = Path(output_path) if output_path else context.project_dir / f"{context.pck_name}.pck"
     result = build_pck(
         source_dir=str(context.resource_dir),
@@ -980,11 +1207,40 @@ def build_project_pck(
         base_prefix=f"{context.pck_name}/",
         convert_pngs=convert_pngs,
     )
+    result["method"] = "python"
     result["project"] = context.as_dict()
     result["source_dir"] = str(context.resource_dir)
     result["base_prefix"] = f"{context.pck_name}/"
     result["validation"] = validation
     return result
+
+
+def _locate_published_pck(context, *, game_dir: str | Path | None) -> Path | None:
+    """Find the PCK produced by the GodotPublish target.
+
+    The target writes to `$(ModsPath)$(ProjectName)/$(ProjectName).pck`. $(ModsPath)
+    resolves via MSBuild property discovery (Steam registry etc.), so we try a
+    handful of plausible locations.
+    """
+    candidates: list[Path] = []
+    # $(MSBuildProjectName) is the .csproj file stem — that's what the target uses.
+    project_name = context.csproj_path.stem if context.csproj_path else context.pck_name
+    pck_leaf = f"{project_name}.pck"
+
+    if game_dir:
+        candidates.append(Path(game_dir) / "mods" / project_name / pck_leaf)
+
+    env_game_dir = os.environ.get("STS2_GAME_DIR")
+    if env_game_dir:
+        candidates.append(Path(env_game_dir) / "mods" / project_name / pck_leaf)
+
+    # Also check the project directory itself, in case the user redirected output.
+    candidates.append(context.project_dir / pck_leaf)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def deploy_project(
@@ -1071,11 +1327,23 @@ def deploy_project(
         missing.append(f"No build output found under bin/{configuration} for assembly {context.assembly_name}")
 
     if context.manifest_path and context.manifest_path.exists():
-        shutil.copy2(context.manifest_path, target_dir / "mod_manifest.json")
-        copied_files.append("mod_manifest.json")
-        desired_names.add("mod_manifest.json")
+        manifest_dest_name = context.manifest_path.name
+        shutil.copy2(context.manifest_path, target_dir / manifest_dest_name)
+        copied_files.append(manifest_dest_name)
+        desired_names.add(manifest_dest_name.lower())
+        # The game registers one mod per manifest file. If an older install wrote
+        # the manifest under a different name (e.g. mod_manifest.json), remove it
+        # so the mod doesn't get loaded twice.
+        if manifest_dest_name.lower() != "mod_manifest.json":
+            stale_manifest = target_dir / "mod_manifest.json"
+            if stale_manifest.exists():
+                try:
+                    stale_manifest.unlink()
+                    stale_removed.append("mod_manifest.json")
+                except PermissionError:
+                    pass
     else:
-        missing.append("mod_manifest.json")
+        missing.append(context.manifest_path.name if context.manifest_path else "manifest")
 
     if include_pck is None:
         include_pck = context.has_pck
@@ -1160,6 +1428,7 @@ def build_and_deploy_project(
             )
             pck_future: Future[dict[str, Any]] = executor.submit(
                 build_project_pck, project_dir,
+                configuration=configuration, game_dir=game_dir,
             )
             build_result = build_future.result()
             pck_result = pck_future.result()
@@ -1371,9 +1640,10 @@ def package_mod(project_dir: str | Path, output_path: str = "") -> dict[str, Any
 
     files_to_include: list[tuple[str, Path]] = []
 
-    # Manifest
+    # Manifest — preserve source filename (e.g. Sadida.json) to avoid
+    # duplicate-registration when the game loads one mod per manifest file.
     if context.manifest_path and context.manifest_path.exists():
-        files_to_include.append(("mod_manifest.json", context.manifest_path))
+        files_to_include.append((context.manifest_path.name, context.manifest_path))
 
     # Build artifacts (try Debug then Release)
     for config in ("Debug", "Release"):
