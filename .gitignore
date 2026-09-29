@@ -10,6 +10,8 @@ build/
 
 # Decompiled game source (regenerated from sts2.dll)
 decompiled/
+decompiled-main/
+decompiled-beta/
 
 # Recovered Godot project (regenerated from game PCK)
 recovered/

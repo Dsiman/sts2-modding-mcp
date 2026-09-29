@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Entities.Creatures;
+using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Localization.DynamicVars;
 using MegaCrit.Sts2.Core.Logging;
@@ -45,7 +46,7 @@ public sealed class McpTestRelic : RelicModel
             ValueProp.Unpowered,
             null);
 
-        await PowerCmd.Apply<StrengthPower>(
+        await PowerCmd.Apply<StrengthPower>(new ThrowingPlayerChoiceContext(), 
             Owner.Creature,
             3M,
             Owner.Creature,
